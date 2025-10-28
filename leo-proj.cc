@@ -3,6 +3,7 @@
 #include "ns3/internet-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/mobility-module.h"
 #include <fstream>
 
 using namespace ns3;
@@ -71,7 +72,6 @@ private:
         Ptr<Packet> pkt;
         while ((pkt = socket->Recv()))
         {
-            // 模擬壓縮處理延遲
             Simulator::Schedule(MilliSeconds(m_delayMs), &LEOApp::SendCompressed, this, pkt);
         }
     }
@@ -99,21 +99,43 @@ void GroundReceive(Ptr<Socket> socket)
     }
 }
 
+double CalculatePropDelay(Ptr<Node> a, Ptr<Node> b)
+{
+    Vector posA = a->GetObject<MobilityModel>()->GetPosition();
+    Vector posB = b->GetObject<MobilityModel>()->GetPosition();
+    double distance = (posB - posA).GetLength(); // m
+    return distance / 3e8; // 光速 
+}
+
 void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
 {
     NodeContainer nodes;
     nodes.Create(3); // Source, LEO, Ground
 
+    // 設置三維位置
+    Ptr<ListPositionAllocator> posAlloc = CreateObject<ListPositionAllocator>();
+    posAlloc->Add(Vector(0, 0, 500));       // Source 高度 500 m
+    posAlloc->Add(Vector(1000, 0, 600e3));  // LEO 高度 600 km
+    posAlloc->Add(Vector(0, 0, 0));         // Ground 地面
+    MobilityHelper mobility;
+    mobility.SetPositionAllocator(posAlloc);
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(nodes);
+
+    // 計算 propagation delay
+    double delaySrcLEO = CalculatePropDelay(nodes.Get(0), nodes.Get(1));
+    double delayLEOGnd = CalculatePropDelay(nodes.Get(1), nodes.Get(2));
+
     // Source -> LEO
     PointToPointHelper p2p1;
     p2p1.SetDeviceAttribute("DataRate", StringValue("100Kbps"));
-    p2p1.SetChannelAttribute("Delay", StringValue("500ms"));
+    p2p1.SetChannelAttribute("Delay", TimeValue(Seconds(delaySrcLEO)));
     NetDeviceContainer dev1 = p2p1.Install(nodes.Get(0), nodes.Get(1));
 
     // LEO -> Ground
     PointToPointHelper p2p2;
     p2p2.SetDeviceAttribute("DataRate", StringValue("100Kbps"));
-    p2p2.SetChannelAttribute("Delay", StringValue("500ms"));
+    p2p2.SetChannelAttribute("Delay", TimeValue(Seconds(delayLEOGnd)));
     NetDeviceContainer dev2 = p2p2.Install(nodes.Get(1), nodes.Get(2));
 
     InternetStackHelper internet;
@@ -128,7 +150,6 @@ void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
     // Source socket
     Ptr<Socket> sourceSock = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
     Address leoAddr = InetSocketAddress(if1.GetAddress(1), 8080);
-
     Ptr<SourceApp> sourceApp = CreateObject<SourceApp>();
     sourceApp->Setup(sourceSock, leoAddr, pktSize);
     nodes.Get(0)->AddApplication(sourceApp);
@@ -138,11 +159,9 @@ void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
     // LEO socket
     Ptr<Socket> leoRecvSock = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
     leoRecvSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8080));
-
     Ptr<Socket> leoSendSock = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
     Address groundAddr = InetSocketAddress(if2.GetAddress(1), 8080);
     leoSendSock->Connect(groundAddr);
-
     Ptr<LEOApp> leoApp = CreateObject<LEOApp>();
     leoApp->Setup(leoRecvSock, leoSendSock, ratio, delayMs);
     nodes.Get(1)->AddApplication(leoApp);
@@ -165,16 +184,16 @@ void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
 
     g_output << ratio << "," << delayMs << "," << pktSize << "," << totalTime << endl;
     cout << "Ratio=" << ratio
-         << " Delay=" << delayMs
-         << " Pkt=" << pktSize
-         << " TotalTime=" << totalTime
+         << " Delay(ms)=" << delayMs
+         << " Pkt(byte)=" << pktSize
+         << " TotalTime(s)=" << totalTime
          << endl;
 }
 
 int main(int argc, char *argv[])
 {
     g_output.open("leo-results.csv");
-    g_output << "CompressionRatio,DelayMs,PacketSize,TotalTransmissionTime(s)" << endl;
+    g_output << "CompressionRatio,Delay(ms),PacketSize(byte),TotalTransmissionTime(s)" << endl;
 
     double ratios[] = {1.0, 0.5, 0.2};
     uint32_t delays[] = {0, 500, 10000};
