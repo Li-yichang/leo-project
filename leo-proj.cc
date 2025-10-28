@@ -4,7 +4,6 @@
 #include "ns3/applications-module.h"
 #include "ns3/point-to-point-module.h"
 #include <fstream>
-#include <vector>
 
 using namespace ns3;
 using std::cout;
@@ -13,21 +12,50 @@ using std::endl;
 NS_LOG_COMPONENT_DEFINE("LeoProj");
 
 static std::ofstream g_output;
-static uint32_t g_recvCount = 0;
 static double g_startTime = 0;
 static double g_endTime = 0;
 
-class CompressorApp : public Application
+class SourceApp : public Application
 {
 public:
-    CompressorApp() {}
-    virtual ~CompressorApp() {}
+    SourceApp() {}
+    virtual ~SourceApp() {}
 
-    void Setup(Ptr<Socket> socket, Address address, uint32_t pktSize, double ratio, uint32_t delayMs)
+    void Setup(Ptr<Socket> socket, Address peer, uint32_t pktSize)
     {
         m_socket = socket;
-        m_peerAddress = address;
+        m_peer = peer;
         m_pktSize = pktSize;
+    }
+
+private:
+    virtual void StartApplication()
+    {
+        m_socket->Connect(m_peer);
+        Simulator::Schedule(Seconds(0.1), &SourceApp::SendPacket, this);
+    }
+
+    void SendPacket()
+    {
+        Ptr<Packet> pkt = Create<Packet>(m_pktSize);
+        m_socket->Send(pkt);
+    }
+
+    Ptr<Socket> m_socket;
+    Address m_peer;
+    uint32_t m_pktSize;
+};
+
+class LEOApp : public Application
+{
+public:
+    LEOApp() {}
+    virtual ~LEOApp() {}
+
+    void Setup(Ptr<Socket> recvSock, Ptr<Socket> sendSock, double ratio, uint32_t delayMs)
+    {
+        m_recvSock = recvSock;
+        m_sendSock = sendSock;
         m_ratio = ratio;
         m_delayMs = delayMs;
     }
@@ -35,129 +63,130 @@ public:
 private:
     virtual void StartApplication()
     {
-        m_socket->Connect(m_peerAddress);
-        Simulator::Schedule(Seconds(0.1), &CompressorApp::SendPacket, this);
+        m_recvSock->SetRecvCallback(MakeCallback(&LEOApp::ReceivePacket, this));
     }
 
-    virtual void StopApplication()
+    void ReceivePacket(Ptr<Socket> socket)
     {
-        if (m_socket)
-            m_socket->Close();
+        Ptr<Packet> pkt;
+        while ((pkt = socket->Recv()))
+        {
+            // 模擬壓縮處理延遲
+            Simulator::Schedule(MilliSeconds(m_delayMs), &LEOApp::SendCompressed, this, pkt);
+        }
     }
 
-    void SendPacket()
-    {
-        Ptr<Packet> pkt = Create<Packet>(m_pktSize);
-
-        // 模擬處理延遲後再壓縮
-        Simulator::Schedule(MilliSeconds(m_delayMs), &CompressorApp::DelayedSend, this, pkt);
-
-        // 每 n 秒發送一個封包
-        double interval = (m_pktSize * m_ratio * 8) / (100 * 1000); // 秒
-        Simulator::Schedule(Seconds(interval), &CompressorApp::SendPacket, this);
-
-
-    }
-
-    void DelayedSend(Ptr<Packet> pkt)
+    void SendCompressed(Ptr<Packet> pkt)
     {
         uint32_t newSize = static_cast<uint32_t>(pkt->GetSize() * m_ratio);
         Ptr<Packet> compressed = Create<Packet>(newSize);
-        m_socket->Send(compressed);
+        m_sendSock->Send(compressed);
     }
 
 private:
-    Ptr<Socket> m_socket;
-    Address m_peerAddress;
-    uint32_t m_pktSize;
+    Ptr<Socket> m_recvSock;
+    Ptr<Socket> m_sendSock;
     double m_ratio;
     uint32_t m_delayMs;
 };
 
-void ReceivePacket(Ptr<Socket> socket)
+void GroundReceive(Ptr<Socket> socket)
 {
     Ptr<Packet> pkt;
-    while ((pkt = socket->Recv()))
+    if ((pkt = socket->Recv()))
     {
-        if (g_recvCount == 0)
-            g_startTime = Simulator::Now().GetSeconds();
-        g_recvCount++;
         g_endTime = Simulator::Now().GetSeconds();
     }
 }
 
-void RunOneExperiment(uint32_t sats, double ratio, uint32_t delayMs, uint32_t pktSize)
+void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
 {
     NodeContainer nodes;
-    nodes.Create(2);
+    nodes.Create(3); // Source, LEO, Ground
 
-    PointToPointHelper p2p;
-    p2p.SetDeviceAttribute("DataRate", StringValue("100Kbps"));
-    p2p.SetChannelAttribute("Delay", StringValue("1000ms"));
-    NetDeviceContainer dev = p2p.Install(nodes);
+    // Source -> LEO
+    PointToPointHelper p2p1;
+    p2p1.SetDeviceAttribute("DataRate", StringValue("100Kbps"));
+    p2p1.SetChannelAttribute("Delay", StringValue("500ms"));
+    NetDeviceContainer dev1 = p2p1.Install(nodes.Get(0), nodes.Get(1));
+
+    // LEO -> Ground
+    PointToPointHelper p2p2;
+    p2p2.SetDeviceAttribute("DataRate", StringValue("100Kbps"));
+    p2p2.SetChannelAttribute("Delay", StringValue("500ms"));
+    NetDeviceContainer dev2 = p2p2.Install(nodes.Get(1), nodes.Get(2));
 
     InternetStackHelper internet;
     internet.Install(nodes);
+
     Ipv4AddressHelper ipv4;
     ipv4.SetBase("10.0.0.0", "255.255.255.0");
-    Ipv4InterfaceContainer ifc = ipv4.Assign(dev);
+    Ipv4InterfaceContainer if1 = ipv4.Assign(dev1);
+    ipv4.SetBase("10.0.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer if2 = ipv4.Assign(dev2);
 
-    Ptr<Socket> recvSocket = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
-    InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), 8080);
-    recvSocket->Bind(local);
-    recvSocket->SetRecvCallback(MakeCallback(&ReceivePacket));
+    // Source socket
+    Ptr<Socket> sourceSock = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    Address leoAddr = InetSocketAddress(if1.GetAddress(1), 8080);
 
-    Ptr<Socket> sendSocket = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
-    Address remote = InetSocketAddress(ifc.GetAddress(1), 8080);
+    Ptr<SourceApp> sourceApp = CreateObject<SourceApp>();
+    sourceApp->Setup(sourceSock, leoAddr, pktSize);
+    nodes.Get(0)->AddApplication(sourceApp);
+    sourceApp->SetStartTime(Seconds(1.0));
+    sourceApp->SetStopTime(Seconds(2.0));
 
-    Ptr<CompressorApp> app = CreateObject<CompressorApp>();
-    app->Setup(sendSocket, remote, pktSize, ratio, delayMs);
-    nodes.Get(0)->AddApplication(app);
-    app->SetStartTime(Seconds(1.0));
-    app->SetStopTime(Seconds(30.0));
+    // LEO socket
+    Ptr<Socket> leoRecvSock = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
+    leoRecvSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8080));
 
-    g_recvCount = 0;
-    g_startTime = 0;
+    Ptr<Socket> leoSendSock = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
+    Address groundAddr = InetSocketAddress(if2.GetAddress(1), 8080);
+    leoSendSock->Connect(groundAddr);
+
+    Ptr<LEOApp> leoApp = CreateObject<LEOApp>();
+    leoApp->Setup(leoRecvSock, leoSendSock, ratio, delayMs);
+    nodes.Get(1)->AddApplication(leoApp);
+    leoApp->SetStartTime(Seconds(1.0));
+    leoApp->SetStopTime(Seconds(40.0));
+
+    // Ground socket
+    Ptr<Socket> groundSock = Socket::CreateSocket(nodes.Get(2), UdpSocketFactory::GetTypeId());
+    groundSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8080));
+    groundSock->SetRecvCallback(MakeCallback(&GroundReceive));
+
+    g_startTime = 1.0; // Source 發送時間
     g_endTime = 0;
 
-    Simulator::Stop(Seconds(40.0));
+    Simulator::Stop(Seconds(50.0));
     Simulator::Run();
     Simulator::Destroy();
 
     double totalTime = g_endTime - g_startTime;
-    double SingleTime=totalTime/g_recvCount;
-    g_output << sats << "," << ratio << "," << delayMs << "," << pktSize << "," << g_recvCount << "," << totalTime << "," << SingleTime << endl;
 
-    cout << "Sats=" << sats
-         << " Ratio=" << ratio
+    g_output << ratio << "," << delayMs << "," << pktSize << "," << totalTime << endl;
+    cout << "Ratio=" << ratio
          << " Delay=" << delayMs
          << " Pkt=" << pktSize
-         << " Count=" << g_recvCount
-         << " TotalTime=" << totalTime 
-         << " singleTime=" << SingleTime
+         << " TotalTime=" << totalTime
          << endl;
 }
 
 int main(int argc, char *argv[])
 {
     g_output.open("leo-results.csv");
-    g_output << "Satellites,CompressionRatio,DelayMs,PacketSize,PacketsReceived,TotalTransmissionTime(s),singleTransmissionTime(s)" << endl;
+    g_output << "CompressionRatio,DelayMs,PacketSize,TotalTransmissionTime(s)" << endl;
 
-    uint32_t sats[] = {6};
     double ratios[] = {1.0, 0.5, 0.2};
-    uint32_t delays[] = {0, 500,10000};
+    uint32_t delays[] = {0, 500, 10000};
     uint32_t pkts[] = {1000, 5000, 10000};
 
-    for (auto s : sats)
+    for (auto r : ratios)
     {
-        for (auto r : ratios)
+        for (auto d : delays)
         {
-            for (auto d : delays)
+            for (auto p : pkts)
             {
-                for (auto p : pkts)
-                {
-                    RunOneExperiment(s, r, d, p);
-                }
+                RunExperiment(r, d, p);
             }
         }
     }
