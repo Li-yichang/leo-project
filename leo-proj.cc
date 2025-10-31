@@ -15,6 +15,7 @@ NS_LOG_COMPONENT_DEFINE("LeoProj");
 static std::ofstream g_output;
 static double g_startTime = 0;
 static double g_endTime = 0;
+static double g_leoSendTime = 0; 
 
 class SourceApp : public Application
 {
@@ -80,14 +81,20 @@ private:
     {
         uint32_t newSize = static_cast<uint32_t>(pkt->GetSize() * m_ratio);
         Ptr<Packet> compressed = Create<Packet>(newSize);
+        g_leoSendTime = Simulator::Now().GetSeconds(); // 記錄壓縮完成時間
         m_sendSock->Send(compressed);
+        m_totalCompressedBits += newSize * 8;
     }
+
+public:
+    double GetTotalCompressedBits() const { return m_totalCompressedBits; }
 
 private:
     Ptr<Socket> m_recvSock;
     Ptr<Socket> m_sendSock;
     double m_ratio;
     uint32_t m_delayMs;
+    double m_totalCompressedBits = 0; // 下行 bits
 };
 
 void GroundReceive(Ptr<Socket> socket)
@@ -104,19 +111,18 @@ double CalculatePropDelay(Ptr<Node> a, Ptr<Node> b)
     Vector posA = a->GetObject<MobilityModel>()->GetPosition();
     Vector posB = b->GetObject<MobilityModel>()->GetPosition();
     double distance = (posB - posA).GetLength(); // m
-    return distance / 3e8; // 光速 
+    return distance / 3e8; 
 }
 
-void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
+void RunExperiment(double ratio, uint32_t delayMode, uint32_t pktSize)
 {
     NodeContainer nodes;
     nodes.Create(3); // Source, LEO, Ground
 
-    // 設置三維位置
     Ptr<ListPositionAllocator> posAlloc = CreateObject<ListPositionAllocator>();
-    posAlloc->Add(Vector(0, 0, 500));       // Source 高度 500 m
-    posAlloc->Add(Vector(1000, 0, 600e3));  // LEO 高度 600 km
-    posAlloc->Add(Vector(0, 0, 0));         // Ground 地面
+    posAlloc->Add(Vector(0, 0, 0));       // nycu
+    posAlloc->Add(Vector(0, 1000, 600e3));  // LEO 高度 600 km
+    posAlloc->Add(Vector(0, 270e3, 0));         // kaohsiung
     MobilityHelper mobility;
     mobility.SetPositionAllocator(posAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
@@ -162,8 +168,10 @@ void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
     Ptr<Socket> leoSendSock = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
     Address groundAddr = InetSocketAddress(if2.GetAddress(1), 8080);
     leoSendSock->Connect(groundAddr);
+
+    uint32_t compressDelayMs = (delayMode == 0) ? 0 : static_cast<uint32_t>(5.0 * (pktSize / 1000.0) / ratio);
     Ptr<LEOApp> leoApp = CreateObject<LEOApp>();
-    leoApp->Setup(leoRecvSock, leoSendSock, ratio, delayMs);
+    leoApp->Setup(leoRecvSock, leoSendSock, ratio, compressDelayMs);
     nodes.Get(1)->AddApplication(leoApp);
     leoApp->SetStartTime(Seconds(1.0));
     leoApp->SetStopTime(Seconds(40.0));
@@ -173,19 +181,36 @@ void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
     groundSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8080));
     groundSock->SetRecvCallback(MakeCallback(&GroundReceive));
 
-    g_startTime = 1.0; // Source 發送時間
+    g_startTime = 1.0; 
     g_endTime = 0;
+    g_leoSendTime = 0;
 
     Simulator::Stop(Seconds(50.0));
     Simulator::Run();
     Simulator::Destroy();
 
+    // throughput
+    double upBits = pktSize * 8;
+    double upTime = g_leoSendTime - g_startTime; // Source→LEO 
+    double upThroughput = upBits / upTime / 1e6; // Mbps
+
+    double downBits = leoApp->GetTotalCompressedBits();
+    double downTime = g_endTime - g_leoSendTime; // LEO→Ground 
+    double downThroughput = downBits / downTime / 1e6; // Mbps
+
     double totalTime = g_endTime - g_startTime;
 
-    g_output << ratio << "," << delayMs << "," << pktSize << "," << totalTime << endl;
+    g_output << ratio << "," << delayMode << "," << pktSize << ","
+             << compressDelayMs << ","
+             << upThroughput << "," << downThroughput << ","
+             << totalTime << endl;
+
     cout << "Ratio=" << ratio
-         << " Delay(ms)=" << delayMs
+         << " DelayMode=" << delayMode
          << " Pkt(byte)=" << pktSize
+         << " CompressDelay(ms)=" << compressDelayMs
+         << " Up(Mbps)=" << upThroughput
+         << " Down(Mbps)=" << downThroughput
          << " TotalTime(s)=" << totalTime
          << endl;
 }
@@ -193,10 +218,10 @@ void RunExperiment(double ratio, uint32_t delayMs, uint32_t pktSize)
 int main(int argc, char *argv[])
 {
     g_output.open("leo-results.csv");
-    g_output << "CompressionRatio,Delay(ms),PacketSize(byte),TotalTransmissionTime(s)" << endl;
+    g_output << "CompressionRatio,DelayMode,PacketSize(byte),CompressDelay(ms),UpThroughput(Mbps),DownThroughput(Mbps),TotalTime(s)" << endl;
 
     double ratios[] = {1.0, 0.5, 0.2};
-    uint32_t delays[] = {0, 500, 10000};
+    uint32_t delays[] = {0, 1}; 
     uint32_t pkts[] = {1000, 5000, 10000};
 
     for (auto r : ratios)
@@ -211,6 +236,6 @@ int main(int argc, char *argv[])
     }
 
     g_output.close();
-    cout << "All 27 experiments completed." << endl;
+    cout << "All experiments completed." << endl;
     return 0;
 }
