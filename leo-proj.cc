@@ -4,27 +4,51 @@
 #include "ns3/applications-module.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/mobility-module.h"
+
 #include <fstream>
 #include <vector>
 #include <sstream>
+#include <iostream>
+#include <map>
+#include <set>
 
 using namespace ns3;
 using std::vector;
 using std::string;
+using std::map;
+using std::set;
 
-NS_LOG_COMPONENT_DEFINE("LeoProj");
+NS_LOG_COMPONENT_DEFINE("LeoPathForward");
 
 static std::ofstream g_output;
 static double g_startTime = 0.0;
 static double g_leo1SendTime = 0.0;
 static double g_endTime = 0.0;
+static std::vector<int> g_path; // path user input: values in 1..7
 
+// IpMap[from][to] = Ipv4Address of "to" as seen from "from" (i.e. the address we send to)
+using IpMap = std::map<int, std::map<int, Ipv4Address>>;
+
+// Calculate propagation delay based on positions (speed of light)
 static double CalcPropDelay(Ptr<Node> a, Ptr<Node> b)
 {
     Vector pa = a->GetObject<MobilityModel>()->GetPosition();
     Vector pb = b->GetObject<MobilityModel>()->GetPosition();
     double dist = (pb - pa).GetLength();
     return dist / 3e8;
+}
+
+// Parse user input path e.g. "1 2 3 5"
+static std::vector<int> ParsePathLine(const std::string &line)
+{
+    std::vector<int> out;
+    std::stringstream ss(line);
+    int x;
+    while (ss >> x)
+    {
+        if (x >= 1 && x <= 7) out.push_back(x);
+    }
+    return out;
 }
 
 class SourceApp : public Application
@@ -48,7 +72,8 @@ private:
     {
         Ptr<Packet> pkt = Create<Packet>(m_pktSize);
         m_socket->SendTo(pkt, 0, InetSocketAddress(m_dest, m_port));
-        g_startTime = Simulator::Now().GetSeconds();
+        // record start time at actual send
+        if (g_startTime == 0.0) g_startTime = Simulator::Now().GetSeconds();
     }
 
     Ptr<Socket> m_socket;
@@ -62,8 +87,9 @@ class DynamicForwardApp : public Application
 public:
     void Setup(Ptr<Socket> recvSock,
                const std::vector<Ptr<Node>>& nodes,
-               const std::vector<Ipv4InterfaceContainer>& ifcs,
+               const IpMap &ipMap,
                int nodeIndex,
+               const std::vector<int>& path,
                int destNodeId,
                bool compress,
                double ratio,
@@ -71,8 +97,9 @@ public:
     {
         m_recvSock = recvSock;
         m_nodes = nodes;
-        m_ifcs = ifcs;
+        m_ipMap = ipMap;
         m_nodeIndex = nodeIndex;
+        m_path = path;
         m_destNodeId = destNodeId;
         m_compress = compress;
         m_ratio = ratio;
@@ -89,15 +116,18 @@ private:
             m_recvSock->SetRecvCallback(MakeCallback(&DynamicForwardApp::HandleRecv, this));
     }
 
-    // choose next hop
-    int GetNextHop() { return m_nodeIndex + 1; }
-
-    Ipv4Address GetIpOfNodeOnLink(int current, int next)
+    // find next node id according to m_path
+    int GetNextHopNodeId()
     {
-        int linkIdx = std::min(current, next);
-        if (linkIdx < 0 || linkIdx >= (int)m_ifcs.size()) return Ipv4Address::GetZero();
-        if (next == linkIdx) return m_ifcs[linkIdx].GetAddress(0);
-        else return m_ifcs[linkIdx].GetAddress(1);
+        for (size_t i = 0; i < m_path.size(); ++i)
+        {
+            if (m_path[i] == m_nodeIndex)
+            {
+                if (i + 1 < m_path.size()) return m_path[i + 1];
+                else return m_destNodeId;
+            }
+        }
+        return -1;  
     }
 
     void HandleRecv(Ptr<Socket> sock)
@@ -107,24 +137,34 @@ private:
         {
             if (m_nodeIndex == m_destNodeId)
             {
-                g_endTime = Simulator::Now().GetSeconds();
+                if (g_endTime == 0.0) g_endTime = Simulator::Now().GetSeconds();
                 return;
             }
 
             uint32_t forwardSize = pkt->GetSize();
 
+            // compress if this node compresses
             if (m_compress)
             {
-                forwardSize = static_cast<uint32_t>(forwardSize * m_ratio);
+                forwardSize = static_cast<uint32_t>(std::max<uint32_t>(1, static_cast<uint32_t>(forwardSize * m_ratio)));
                 pkt = Create<Packet>(forwardSize);
                 m_totalCompressedBits += (double)forwardSize * 8.0;
-                if (g_leo1SendTime == 0.0) g_leo1SendTime = Simulator::Now().GetSeconds();
+
+                if (g_leo1SendTime == 0.0)
+                    g_leo1SendTime = Simulator::Now().GetSeconds();
             }
 
-            int next = GetNextHop();
-            if (next > m_destNodeId) return;
 
-            Ipv4Address nextIp = GetIpOfNodeOnLink(m_nodeIndex, next);
+            int nextNode = GetNextHopNodeId();
+            if (nextNode < 0) {
+                return;
+            }
+            auto itFrom = m_ipMap.find(m_nodeIndex);
+            if (itFrom == m_ipMap.end()) return;
+            auto itTo = itFrom->second.find(nextNode);
+            if (itTo == itFrom->second.end()) return;
+
+            Ipv4Address nextIp = itTo->second;
             if (nextIp == Ipv4Address::GetZero()) return;
 
             Ptr<Socket> sendSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
@@ -135,8 +175,9 @@ private:
 private:
     Ptr<Socket> m_recvSock;
     std::vector<Ptr<Node>> m_nodes;
-    std::vector<Ipv4InterfaceContainer> m_ifcs;
+    IpMap m_ipMap;
     int m_nodeIndex;
+    std::vector<int> m_path;
     int m_destNodeId;
     bool m_compress;
     double m_ratio;
@@ -144,32 +185,58 @@ private:
     double m_totalCompressedBits;
 };
 
-// Ground receive 
 static void GroundRecvCb(Ptr<Socket> sock)
 {
     Ptr<Packet> pkt;
     while ((pkt = sock->Recv()))
     {
-        g_endTime = Simulator::Now().GetSeconds();
+        if (g_endTime == 0.0) g_endTime = Simulator::Now().GetSeconds();
     }
 }
 
-void RunExperiment(double ratio, uint32_t pktSize)
+static void CreateP2PAndAssign(NodeContainer &nodes, int a, int b,
+                               PointToPointHelper &p2p,
+                               Ipv4AddressHelper &ipv4helper,
+                               IpMap &ipMap,
+                               uint32_t &netCounter)
 {
-    const int N = 9; // 0=Source,1=LEO1,..7=LEO7,8=Ground
+    double dsec = CalcPropDelay(nodes.Get(a), nodes.Get(b));
+    p2p.SetChannelAttribute("Delay", TimeValue(Seconds(dsec)));
+
+    NetDeviceContainer ndc = p2p.Install(nodes.Get(a), nodes.Get(b));
+
+    std::ostringstream base;
+    base << "10." << (netCounter / 256) << "." << (netCounter % 256) << ".0";
+    ipv4helper.SetBase(base.str().c_str(), "255.255.255.0");
+    Ipv4InterfaceContainer ifc = ipv4helper.Assign(ndc);
+
+    ipMap[a][b] = ifc.GetAddress(1);
+    ipMap[b][a] = ifc.GetAddress(0);
+
+    ++netCounter;
+}
+
+void RunExperiment(const std::vector<int> &path, double ratio, uint32_t pktSize)
+{
+    g_startTime = 0.0;
+    g_leo1SendTime = 0.0;
+    g_endTime = 0.0;
+
+    const int N = 9; 
     NodeContainer nodes;
     nodes.Create(N);
 
+    // positions
     Ptr<ListPositionAllocator> posAlloc = CreateObject<ListPositionAllocator>();
-    posAlloc->Add(Vector(0, 0, 0));             // Source
-    posAlloc->Add(Vector(34980, 1020, 600e3));  // LEO1
-    posAlloc->Add(Vector(9820, 34000, 650e3));  
-    posAlloc->Add(Vector(24000, 34900, 700e3)); 
-    posAlloc->Add(Vector(23200, 20000, 750e3)); 
-    posAlloc->Add(Vector(673450, 94350, 800e3));  
-    posAlloc->Add(Vector(46570, 94200, 850e3));  
-    posAlloc->Add(Vector(13434, 340, 900e3));    
-    posAlloc->Add(Vector(0, 270e3, 0));         // Ground
+    posAlloc->Add(Vector(0, 0, 0));             // Source 0
+    posAlloc->Add(Vector(34980, 1020, 600e3));  // 1
+    posAlloc->Add(Vector(9820, 34000, 650e3));  // 2
+    posAlloc->Add(Vector(24000, 34900, 700e3)); // 3
+    posAlloc->Add(Vector(23200, 20000, 750e3)); // 4
+    posAlloc->Add(Vector(673450, 94350, 800e3));// 5
+    posAlloc->Add(Vector(46570, 94200, 850e3)); // 6
+    posAlloc->Add(Vector(13434, 340, 900e3));   // 7
+    posAlloc->Add(Vector(0, 270e3, 0));         // Ground 8
 
     MobilityHelper mobility;
     mobility.SetPositionAllocator(posAlloc);
@@ -179,61 +246,93 @@ void RunExperiment(double ratio, uint32_t pktSize)
     InternetStackHelper internet;
     internet.Install(nodes);
 
-    //  P2P 
+    // P2P helper
     PointToPointHelper p2p;
     p2p.SetDeviceAttribute("DataRate", StringValue("100Kbps"));
-    std::vector<NetDeviceContainer> devs;
-    for (int i = 0; i < N - 1; ++i)
-    {
-        double dsec = CalcPropDelay(nodes.Get(i), nodes.Get(i + 1));
-        p2p.SetChannelAttribute("Delay", TimeValue(Seconds(dsec)));
-        devs.push_back(p2p.Install(nodes.Get(i), nodes.Get(i + 1)));
-    }
 
-    // IP assignment
-    Ipv4AddressHelper ipv4;
-    std::vector<Ipv4InterfaceContainer> ifcs;
-    for (int i = 0; i < (int)devs.size(); ++i)
+    IpMap ipMap;
+    Ipv4AddressHelper ipv4helper;
+    uint32_t netCounter = 1; // unique counter for network bases
+
+    if (!path.empty())
     {
-        std::ostringstream base;
-        base << "10.0." << i << ".0";
-        ipv4.SetBase(base.str().c_str(), "255.255.255.0");
-        ifcs.push_back(ipv4.Assign(devs[i]));
+        int firstNode = path.front();
+        CreateP2PAndAssign(nodes, 0, firstNode, p2p, ipv4helper, ipMap, netCounter);
+
+        // adjacent pairs in path
+        for (size_t i = 0; i + 1 < path.size(); ++i)
+        {
+            int a = path[i];
+            int b = path[i + 1];
+            if (ipMap[a].find(b) == ipMap[a].end())
+            {
+                CreateP2PAndAssign(nodes, a, b, p2p, ipv4helper, ipMap, netCounter);
+            }
+        }
+
+        // last -> ground
+        int last = path.back();
+        CreateP2PAndAssign(nodes, last, 8, p2p, ipv4helper, ipMap, netCounter);
+    }
+    else
+    {
+        // no path input -> default chain 0-1-2-...-8
+        CreateP2PAndAssign(nodes, 0, 1, p2p, ipv4helper, ipMap, netCounter);
+        CreateP2PAndAssign(nodes, 1, 8, p2p, ipv4helper, ipMap, netCounter);
     }
 
     const uint16_t PORT = 8080;
 
-    // Source -> LEO1
     Ptr<Socket> srcSock = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
     Ptr<SourceApp> srcApp = CreateObject<SourceApp>();
-    Ipv4Address leo1Ip = ifcs[0].GetAddress(1);
-    srcApp->Setup(srcSock, leo1Ip, PORT, pktSize);
+
+    Ipv4Address firstDestIp = Ipv4Address::GetZero();
+    if (!path.empty())
+    {
+        int firstNode = path.front();
+        if (ipMap[0].find(firstNode) != ipMap[0].end())
+            firstDestIp = ipMap[0][firstNode];
+    }
+    if (firstDestIp == Ipv4Address::GetZero())
+    {
+        if (ipMap[0].find(1) != ipMap[0].end()) firstDestIp = ipMap[0][1];
+    }
+    if (firstDestIp == Ipv4Address::GetZero())
+    {
+        std::cout << "No valid firstDestIp for source. Skipping experiment." << std::endl;
+        g_output << ratio << "," << pktSize << "," << 0 << "," << 0 << "," << 0 << std::endl;
+        return;
+    }
+
+    srcApp->Setup(srcSock, firstDestIp, PORT, pktSize);
     nodes.Get(0)->AddApplication(srcApp);
     srcApp->SetStartTime(Seconds(0.5));
     srcApp->SetStopTime(Seconds(2.0));
 
-    // LEO1~LEO7 applications
-    std::vector<Ptr<Socket>> recvSocks(N);
-    Ptr<DynamicForwardApp> node1AppPtr = 0;
+    // Install DynamicForwardApp on LEOS
+    std::vector<Ptr<DynamicForwardApp>> leoApps(N);
     for (int i = 1; i <= 7; ++i)
     {
-        recvSocks[i] = Socket::CreateSocket(nodes.Get(i), UdpSocketFactory::GetTypeId());
+        Ptr<Socket> recvSock = Socket::CreateSocket(nodes.Get(i), UdpSocketFactory::GetTypeId());
         InetSocketAddress anyAddr = InetSocketAddress(Ipv4Address::GetAny(), PORT);
-        recvSocks[i]->Bind(anyAddr);
+        recvSock->Bind(anyAddr);
 
         Ptr<DynamicForwardApp> app = CreateObject<DynamicForwardApp>();
-        bool compress = (i == 1); // LEO1 compress
-        std::vector<Ptr<Node>> nodePtrs;
-        for (int j = 0; j < N; ++j) nodePtrs.push_back(nodes.Get(j));
-        app->Setup(recvSocks[i], nodePtrs, ifcs, i, N - 1, compress, ratio, PORT);
+
+        bool compress = (!path.empty() && i == path.front()); 
+
+        app->Setup(recvSock, std::vector<Ptr<Node>>(nodes.Begin(), nodes.End()),
+                ipMap, i, path, 8, compress, ratio, PORT);
+
         nodes.Get(i)->AddApplication(app);
         app->SetStartTime(Seconds(0.5));
         app->SetStopTime(Seconds(40.0));
-        if (i == 1) node1AppPtr = app;
+        leoApps[i] = app;
     }
 
+
     // Ground receive
-    Ptr<Socket> gSock = Socket::CreateSocket(nodes.Get(N - 1), UdpSocketFactory::GetTypeId());
+    Ptr<Socket> gSock = Socket::CreateSocket(nodes.Get(8), UdpSocketFactory::GetTypeId());
     InetSocketAddress anyAddr = InetSocketAddress(Ipv4Address::GetAny(), PORT);
     gSock->Bind(anyAddr);
     gSock->SetRecvCallback(MakeCallback(&GroundRecvCb));
@@ -242,13 +341,26 @@ void RunExperiment(double ratio, uint32_t pktSize)
     Simulator::Run();
     Simulator::Destroy();
 
+    // Compute throughputs & total time
     double upBits = (double)pktSize * 8.0;
-    double upTime = (g_leo1SendTime > 0.0) ? (g_leo1SendTime - g_startTime) : 1e-9;
+    const double eps = 1e-9;
+
+    double upTime = (g_leo1SendTime > 0.0 && g_startTime > 0.0) ? (g_leo1SendTime - g_startTime) : eps;
     double upThroughput = upBits / upTime / 1e6;
 
-    double downBits = node1AppPtr ? node1AppPtr->GetTotalCompressedBits() : (double)pktSize * 8.0 * ratio;
+    double downBits = 0.0;
+    for (int idx : g_path) {
+        if (idx >= 1 && idx <= 7 && leoApps[idx] && leoApps[idx]->GetTotalCompressedBits() > 0) {
+            downBits = leoApps[idx]->GetTotalCompressedBits();
+            break;
+        }
+    }
+    if (downBits <= 0.0) downBits = (double)pktSize * 8.0 * ratio;
+
     double downTime = (g_endTime > g_leo1SendTime && g_leo1SendTime > 0.0) ? (g_endTime - g_leo1SendTime) : 1e-9;
     double downThroughput = downBits / downTime / 1e6;
+
+
     double totalTime = (g_endTime > g_startTime && g_startTime > 0.0) ? (g_endTime - g_startTime) : 0.0;
 
     g_output << ratio << "," << pktSize << "," << upThroughput << "," << downThroughput << "," << totalTime << std::endl;
@@ -260,6 +372,16 @@ void RunExperiment(double ratio, uint32_t pktSize)
 
 int main(int argc, char* argv[])
 {
+    std::cout << "there are 1 to 7 SATs, input path sequence,e.g. 1 2 3 5: " << std::endl;
+    std::string line;
+    std::getline(std::cin, line);
+    if (line.size() == 0) std::getline(std::cin, line);
+    g_path = ParsePathLine(line);
+
+    std::cout << "path already set: ";
+    for (int v : g_path) std::cout << v << " ";
+    std::cout << std::endl;
+
     g_output.open("leo-results.csv");
     g_output << "Ratio,PacketSize,Up(Mbps),Down(Mbps),TotalTime(s)" << std::endl;
 
@@ -267,8 +389,12 @@ int main(int argc, char* argv[])
     uint32_t pkts[] = {1000, 5000, 10000};
 
     for (double r : ratios)
+    {
         for (uint32_t p : pkts)
-            RunExperiment(r, p);
+        {
+            RunExperiment(g_path, r, p);
+        }
+    }
 
     g_output.close();
     std::cout << "All experiments completed." << std::endl;
