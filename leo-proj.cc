@@ -229,13 +229,13 @@ void RunExperiment(const std::vector<int> &path, double ratio, uint32_t pktSize)
     // positions
     Ptr<ListPositionAllocator> posAlloc = CreateObject<ListPositionAllocator>();
     posAlloc->Add(Vector(0, 0, 0));             // Source 0
-    posAlloc->Add(Vector(34980, 1020, 600e3));  // 1
-    posAlloc->Add(Vector(9820, 34000, 650e3));  // 2
-    posAlloc->Add(Vector(24000, 34900, 700e3)); // 3
-    posAlloc->Add(Vector(23200, 20000, 750e3)); // 4
-    posAlloc->Add(Vector(673450, 94350, 800e3));// 5
-    posAlloc->Add(Vector(46570, 94200, 850e3)); // 6
-    posAlloc->Add(Vector(13434, 340, 900e3));   // 7
+    posAlloc->Add(Vector(80, 20, 600e3));  // 1
+    posAlloc->Add(Vector(982, 340, 650e3));  // 2
+    posAlloc->Add(Vector(1020, 3490, 700e3)); // 3
+    posAlloc->Add(Vector(2320, 20000, 750e3)); // 4
+    posAlloc->Add(Vector(673450, 9430e3, 800e3));// 5
+    posAlloc->Add(Vector(4657, 94200, 850e3)); // 6
+    posAlloc->Add(Vector(13, 340e3, 600e3));   // 7
     posAlloc->Add(Vector(0, 270e3, 0));         // Ground 8
 
     MobilityHelper mobility;
